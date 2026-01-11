@@ -1,0 +1,325 @@
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const fs = require('fs');
+const DATA_FILE = 'data.json';
+
+// ---- Basic Bot Data & Utils ----
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+function loadData() {
+    if (!fs.existsSync(DATA_FILE)) {
+        fs.writeFileSync(DATA_FILE, JSON.stringify({}));
+    }
+    return JSON.parse(fs.readFileSync(DATA_FILE));
+}
+function saveData(data) {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+function getGuildConfig(guildId) {
+    let data = loadData();
+    if (!data[`guild_${guildId}`]) {
+        data[`guild_${guildId}`] = {
+            minWage: 50,
+            maxWage: 300,
+            cooldown: 60,
+            prefix: '!',
+            currency: '💰',
+            storeItem: 'Rare Sword',
+            storeItemPrice: 500,
+            storeStock: false,
+            storeStockEnd: 0,
+            storeMinMinutes: 10,
+            storeMaxMinutes: 20,
+            storeActiveMinutes: 5
+        };
+        saveData(data);
+    }
+    return data[`guild_${guildId}`];
+}
+function setGuildConfig(guildId, config) {
+    let data = loadData();
+    data[`guild_${guildId}`] = config;
+    saveData(data);
+}
+function getUserData(userId) {
+    let data = loadData();
+    if (!data[userId]) {
+        data[userId] = { balance: 0, inventory: [], lastWork: 0 };
+        saveData(data);
+    }
+    return data[userId];
+}
+function updateUserData(userId, key, value) {
+    let data = loadData();
+    data[userId][key] = value;
+    saveData(data);
+}
+
+// ---- Store Features ----
+const storeTimers = {};
+
+function setupStoreStock(guildId) {
+    // This function schedules random store restocks for the guild
+    const config = getGuildConfig(guildId);
+    if (config.storeStock) {
+        // Already in stock; schedule reset after stock period if not done so
+        const now = Date.now();
+        const timeLeft = config.storeStockEnd - now;
+        if (timeLeft > 0) {
+            if (storeTimers[guildId]) clearTimeout(storeTimers[guildId]);
+            storeTimers[guildId] = setTimeout(() => endStock(guildId), timeLeft);
+        } else {
+            endStock(guildId);
+        }
+        return;
+    }
+    // If not in stock, schedule next restock
+    scheduleRestock(guildId);
+}
+function scheduleRestock(guildId) {
+    const config = getGuildConfig(guildId);
+    // Random minutes: min-max
+    const minMs = config.storeMinMinutes * 60 * 1000;
+    const maxMs = config.storeMaxMinutes * 60 * 1000;
+    const restockMs = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    if (storeTimers[guildId]) clearTimeout(storeTimers[guildId]); // Clear previous
+    storeTimers[guildId] = setTimeout(() => startStock(guildId), restockMs);
+}
+function startStock(guildId) {
+    // Store item comes in stock!
+    const config = getGuildConfig(guildId);
+    config.storeStock = true;
+    config.storeStockEnd = Date.now() + config.storeActiveMinutes * 60 * 1000;
+    setGuildConfig(guildId, config);
+
+    // Schedule stock end reset
+    if (storeTimers[guildId]) clearTimeout(storeTimers[guildId]);
+    storeTimers[guildId] = setTimeout(() => endStock(guildId), config.storeActiveMinutes * 60 * 1000);
+
+    // Announce to some channel if desired; here, no channel specified.
+    // You can add announcement logic if you wish (e.g., default to system channel).
+
+    // Then schedule next restock after this event
+}
+function endStock(guildId) {
+    const config = getGuildConfig(guildId);
+    config.storeStock = false;
+    config.storeStockEnd = 0;
+    setGuildConfig(guildId, config);
+
+    scheduleRestock(guildId);
+}
+// On start, load configs and set up store timers
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}!`);
+    // On ready, set up store restocking for all known guilds
+    const data = loadData();
+    Object.keys(data)
+        .filter(key => key.startsWith('guild_'))
+        .forEach(key => {
+            const guildId = key.replace('guild_', '');
+            setupStoreStock(guildId);
+        });
+});
+
+// ---- Command Handler ----
+client.on('messageCreate', async (message) => {
+    if (message.author.bot || !message.guild) return;
+    const guildId = message.guild.id;
+    const config = getGuildConfig(guildId); // will auto-create defaults
+    const prefix = config.prefix || '!';
+    if (!message.content.startsWith(prefix)) return;
+    const args = message.content.slice(prefix.length).trim().split(/ +/);
+    const cmd = args.shift().toLowerCase();
+
+    // ==== Economy Commands ====
+    if (cmd === 'balance') {
+        const userData = getUserData(message.author.id);
+        message.reply(`You have ${config.currency} ${userData.balance} coins!`);
+    }
+    else if (cmd === 'work') {
+        const userData = getUserData(message.author.id);
+        const now = Date.now();
+        if (now - (userData.lastWork || 0) < config.cooldown * 1000) {
+            const wait = Math.ceil((config.cooldown * 1000 - (now - (userData.lastWork || 0))) / 1000);
+            return message.reply(`⏳ On cooldown! Please wait ${wait} seconds before working again.`);
+        }
+        const earnings = Math.floor(Math.random() * (config.maxWage - config.minWage + 1)) + config.minWage;
+        userData.balance += earnings;
+        userData.lastWork = now;
+        updateUserData(message.author.id, 'balance', userData.balance);
+        updateUserData(message.author.id, 'lastWork', userData.lastWork);
+        message.reply(`You worked and earned ${config.currency} ${earnings} coins!`);
+    }
+    else if (cmd === 'inventory') {
+        const userData = getUserData(message.author.id);
+        const items = userData.inventory;
+        if (items.length === 0) {
+            message.reply("Your inventory is empty!");
+        } else {
+            message.reply(`Your inventory: ${items.join(', ')}`);
+        }
+    }
+    else if (cmd === 'buy') {
+        if (!args.length) return message.reply(`Usage: ${prefix}buy <item>`);
+        const item = args.join(' ');
+        const userData = getUserData(message.author.id);
+        // Special: Is this the store item?
+        if (item.toLowerCase() === config.storeItem.toLowerCase()) {
+            // If it's the store item, check stock
+            if (!config.storeStock) {
+                return message.reply(`❌ "${config.storeItem}" is not in stock right now. Check ${prefix}store for the next stock!`);
+            }
+            const price = config.storeItemPrice;
+            if (userData.balance < price) {
+                return message.reply(`You don’t have enough coins to buy ${item}! (${config.currency}${price} needed)`);
+            }
+            userData.balance -= price;
+            userData.inventory.push(item);
+            updateUserData(message.author.id, 'balance', userData.balance);
+            updateUserData(message.author.id, 'inventory', userData.inventory);
+            message.reply(`You bought the special item **${item}** for ${config.currency}${price} coins!`);
+        } else {
+            // Normal item (fixed price)
+            const price = 100;
+            if (userData.balance < price) {
+                return message.reply(`You don’t have enough coins to buy ${item}.`);
+            }
+            userData.balance -= price;
+            userData.inventory.push(item);
+            updateUserData(message.author.id, 'balance', userData.balance);
+            updateUserData(message.author.id, 'inventory', userData.inventory);
+            message.reply(`You bought **${item}** for ${config.currency}${price} coins!`);
+        }
+    }
+    else if (cmd === 'leaderboard') {
+        const data = loadData();
+        const sorted = Object.entries(data)
+            .filter(([key]) => !key.startsWith('guild_'))
+            .sort((a, b) => (b[1].balance || 0) - (a[1].balance || 0))
+            .slice(0, 5);
+        const embed = new EmbedBuilder()
+            .setTitle('Leaderboard')
+            .setColor(0xFFD700);
+        let idx = 1;
+        for (const [userId, info] of sorted) {
+            const user = await client.users.fetch(userId).catch(() => null);
+            let name = user ? user.username : `UserID: ${userId}`;
+            embed.addFields({ name: `${idx}. ${name}`, value: `${config.currency}${info.balance}`, inline: false });
+            idx++;
+        }
+        message.channel.send({ embeds: [embed] });
+    }
+    // STORE COMMAND: show info and stock
+    else if (cmd === 'store') {
+        const now = Date.now();
+        let desc = '';
+        if (config.storeStock && config.storeStockEnd > now) {
+            const minsLeft = Math.ceil((config.storeStockEnd - now) / 60000);
+            desc = `🟢 **${config.storeItem}** is in stock now for ${minsLeft} more minute(s)! Price: ${config.currency}${config.storeItemPrice}\nType \`${prefix}buy ${config.storeItem}\` to purchase!`;
+        } else {
+            // Compute next restock: not perfectly accurate unless bot persists timers
+            desc = `🔴 **${config.storeItem}** is currently **out of stock**.\nRestocks randomly every ${config.storeMinMinutes}-${config.storeMaxMinutes} minutes for ${config.storeActiveMinutes} minutes each time!`;
+        }
+        const embed = new EmbedBuilder()
+            .setTitle('Store')
+            .setDescription(desc)
+            .setColor(config.storeStock ? 0x4BB543 : 0xFF0000);
+        message.channel.send({ embeds: [embed] });
+    }
+    // ==== HELP COMMAND ====
+    else if (cmd === 'help') {
+        const embed = new EmbedBuilder()
+            .setTitle('Economy Bot Help')
+            .setDescription('Economy, shop, and admin commands:')
+            .setColor(0x00BFFF)
+            .addFields(
+                { name: `${prefix}balance`, value: 'Shows your current balance.' },
+                { name: `${prefix}work`, value: `Earn random coins by working. Has cooldown (${config.cooldown}s).` },
+                { name: `${prefix}inventory`, value: 'Shows your inventory of items.' },
+                { name: `${prefix}buy <item>`, value: `Buy a regular item (${config.currency}100 each) or, when in stock, the special store item (${config.currency}${config.storeItemPrice}).` },
+                { name: `${prefix}store`, value: `Shows info and current stock for the special store item (**${config.storeItem}**). Stock appears/reappears at random times.` },
+                { name: `${prefix}leaderboard`, value: `Displays the top 5 richest users in the server.` },
+                { name: '\u200B', value: '**Admin Commands (server owner only):**' },
+                { name: `${prefix}setwage <min> <max>`, value: 'Set min/max amount you can earn per work.' },
+                { name: `${prefix}setcooldown <seconds>`, value: 'Set the work command cooldown in seconds.' },
+                { name: `${prefix}setcurrency <symbol>`, value: 'Set the currency symbol for your server (e.g. 💸, $, 🪙).' },
+                { name: `${prefix}setprefix <prefix>`, value: 'Set the command prefix (e.g., !, $, &, etc.).' },
+                { name: `${prefix}setstoreitem <item> [price]`, value: `Set the store item name and (optional) price. Example: \`${prefix}setstoreitem "Magic Wand" 1000\`.` },
+                { name: `${prefix}setstoretiming <min> <max> <stockmins>`, value: `Set random restock period and active stock time (all in minutes). Example: \`${prefix}setstoretiming 10 30 5\`.` }
+            )
+            .setFooter({ text: 'Economy Bot - All settings are server-specific. Store item stock appears at random times!' });
+        message.channel.send({ embeds: [embed] });
+    }
+    // ==== Admin commands ====
+    else if (cmd === 'setwage') {
+        if (message.author.id !== message.guild.ownerId) return message.reply('Only the server owner can use this command.');
+        if (args.length < 2 || isNaN(args[0]) || isNaN(args[1])) return message.reply(`Usage: ${prefix}setwage <min> <max>`);
+        const min = Number(args[0]);
+        const max = Number(args[1]);
+        if (min < 0 || max < min) return message.reply('Invalid wage range.');
+        config.minWage = min;
+        config.maxWage = max;
+        setGuildConfig(guildId, config);
+        message.reply(`✅ Work wage set: minimum ${min}, maximum ${max}!`);
+    }
+    else if (cmd === 'setcooldown') {
+        if (message.author.id !== message.guild.ownerId) return message.reply('Only the server owner can use this command.');
+        if (args.length < 1 || isNaN(args[0])) return message.reply(`Usage: ${prefix}setcooldown <seconds>`);
+        const cooldown = Number(args[0]);
+        if (cooldown < 0) return message.reply('Invalid cooldown.');
+        config.cooldown = cooldown;
+        setGuildConfig(guildId, config);
+        message.reply(`✅ Cooldown set to ${cooldown} seconds!`);
+    }
+    else if (cmd === 'setcurrency') {
+        if (message.author.id !== message.guild.ownerId) return message.reply('Only the server owner can use this command.');
+        if (!args.length) return message.reply(`Usage: ${prefix}setcurrency <symbol>`);
+        config.currency = args.join(' ');
+        setGuildConfig(guildId, config);
+        message.reply(`✅ Currency symbol set to \`${config.currency}\`.`);
+    }
+    else if (cmd === 'setprefix') {
+        if (message.author.id !== message.guild.ownerId) return message.reply('Only the server owner can use this command.');
+        if (!args.length) return message.reply('Usage: <current-prefix>setprefix <new-prefix>');
+        let newPrefix = args[0];
+        if (newPrefix.length > 3 || /[^!#$%^&*@~`+=\-_.a-zA-Z0-9]/.test(newPrefix)) {
+            return message.reply('Prefix must be 1-3 normal characters.');
+        }
+        config.prefix = newPrefix;
+        setGuildConfig(guildId, config);
+        message.reply(`✅ Prefix changed to \`${newPrefix}\`. Use \`${newPrefix}balance\` etc.`);
+    }
+    else if (cmd === 'setstoreitem') {
+        if (message.author.id !== message.guild.ownerId) return message.reply('Only the server owner can use this command.');
+        if (!args.length) return message.reply(`Usage: ${prefix}setstoreitem <item> [price]`);
+        let name = args[0];
+        if (args.length > 1 && !isNaN(args[args.length-1])) {
+            // last argument is price
+            config.storeItemPrice = Number(args.pop());
+            name = args.join(' ');
+        } else {
+            name = args.join(' ');
+        }
+        config.storeItem = name;
+        setGuildConfig(guildId, config);
+        message.reply(`✅ Store special item set to "${config.storeItem}" at price ${config.currency}${config.storeItemPrice}!`);
+    }
+    else if (cmd === 'setstoretiming') {
+        if (message.author.id !== message.guild.ownerId) return message.reply('Only the server owner can use this command.');
+        if (args.length < 3 || !args.every(a => !isNaN(a))) return message.reply(`Usage: ${prefix}setstoretiming <min> <max> <stockmins>`);
+        config.storeMinMinutes = Number(args[0]);
+        config.storeMaxMinutes = Number(args[1]);
+        config.storeActiveMinutes = Number(args[2]);
+        setGuildConfig(guildId, config);
+        message.reply(`✅ Store random restock: ${config.storeMinMinutes}-${config.storeMaxMinutes}mins, item stays in stock for ${config.storeActiveMinutes}mins.`);
+        setupStoreStock(guildId);
+    }
+});
+
+// Replace 'YOUR_BOT_TOKEN' with your bot's actual token
+client.login(your bot);
